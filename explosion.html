@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<title>OBS Explosion Trigger</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100vw;
+    height: 100vh;
+    background: transparent;
+    overflow: hidden;
+    font-family: 'Google Sans', 'Microsoft JhengHei', sans-serif;
+  }
+  #stage {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.15s ease-out;
+    pointer-events: none;
+  }
+  #stage.show { opacity: 1; }
+  #canvas {
+    max-width: 100%;
+    max-height: 100%;
+  }
+  #video {
+    position: absolute;
+    visibility: hidden;
+    width: 1px;
+    height: 1px;
+  }
+  #status {
+    position: fixed;
+    bottom: 6px;
+    left: 8px;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.6);
+    text-shadow: 0 0 3px #000;
+    pointer-events: none;
+    transition: opacity 0.5s;
+  }
+  #status.hide { opacity: 0; }
+  #unlock {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.65);
+    color: #fff;
+    font-size: 20px;
+    cursor: pointer;
+    z-index: 9999;
+  }
+  #unlock.hide { display: none; }
+</style>
+</head>
+<body>
+  <div id="stage"><canvas id="canvas"></canvas></div>
+  <video id="video" src="explosion.mp4" preload="auto" playsinline crossorigin="anonymous"></video>
+  <div id="status">connecting...</div>
+  <div id="unlock">點一下任何位置以啟用 ▶</div>
+
+<script>
+// ===================== 設定 =====================
+const CHANNEL = "e0pwr";              // 你的 Twitch 頻道
+const COMMAND = "!explosion";         // 觸發指令
+const COOLDOWN_MS = 1000;             // 全頻道冷卻（毫秒）
+const VIDEO_VOLUME = 1.0;
+
+// --- 去綠幕（chroma key）---
+const CHROMA_KEY     = true;          // 設 false 就播原片
+const KEY_COLOR      = [0.0, 1.0, 0.0]; // RGB 0~1，預設純綠；藍幕就改 [0,0,1]
+const SIMILARITY     = 0.40;          // 相似度門檻（越大去越多）
+const SMOOTHNESS     = 0.10;          // 邊緣羽化（越大邊緣越柔）
+const SPILL          = 0.15;          // 邊緣殘色抑制（去掉綠邊）
+// ================================================
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const stage = document.getElementById("stage");
+const status = document.getElementById("status");
+let lastTrigger = 0;
+
+video.volume = VIDEO_VOLUME;
+
+function setStatus(text, autoHide = false) {
+  status.textContent = text;
+  status.classList.remove("hide");
+  if (autoHide) setTimeout(() => status.classList.add("hide"), 3000);
+}
+
+// ============== WebGL chroma key ==============
+const gl = canvas.getContext("webgl", { premultipliedAlpha: false, alpha: true });
+if (!gl) setStatus("WebGL 不可用");
+
+const vs = `
+attribute vec2 a_pos;
+varying vec2 v_uv;
+void main() {
+  v_uv = vec2((a_pos.x + 1.0) * 0.5, 1.0 - (a_pos.y + 1.0) * 0.5);
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+const fs = `
+precision mediump float;
+varying vec2 v_uv;
+uniform sampler2D u_tex;
+uniform vec3 u_key;
+uniform float u_similarity;
+uniform float u_smoothness;
+uniform float u_spill;
+uniform bool u_enable;
+
+vec2 rgb2cc(vec3 c) {
+  float y  =  0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
+  float cb = -0.169 * c.r - 0.331 * c.g + 0.500 * c.b;
+  float cr =  0.500 * c.r - 0.419 * c.g - 0.081 * c.b;
+  return vec2(cb, cr);
+}
+
+void main() {
+  vec4 c = texture2D(u_tex, v_uv);
+  if (!u_enable) { gl_FragColor = c; return; }
+
+  vec2 keyCC = rgb2cc(u_key);
+  vec2 cc = rgb2cc(c.rgb);
+  float d = distance(cc, keyCC);
+
+  float alpha = smoothstep(u_similarity, u_similarity + u_smoothness, d);
+
+  // spill suppression — 把殘留的綠邊往灰度去飽和
+  float spillMask = 1.0 - smoothstep(u_similarity, u_similarity + u_spill, d);
+  float lum = dot(c.rgb, vec3(0.299, 0.587, 0.114));
+  c.rgb = mix(c.rgb, vec3(lum), spillMask * 0.6);
+
+  gl_FragColor = vec4(c.rgb, alpha);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s));
+  }
+  return s;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+  -1,-1,  1,-1,  -1,1,
+  -1, 1,  1,-1,   1,1,
+]), gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog, "a_pos");
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+gl.uniform3fv(gl.getUniformLocation(prog, "u_key"), KEY_COLOR);
+gl.uniform1f(gl.getUniformLocation(prog, "u_similarity"), SIMILARITY);
+gl.uniform1f(gl.getUniformLocation(prog, "u_smoothness"), SMOOTHNESS);
+gl.uniform1f(gl.getUniformLocation(prog, "u_spill"), SPILL);
+gl.uniform1i(gl.getUniformLocation(prog, "u_enable"), CHROMA_KEY ? 1 : 0);
+
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+let rafId = null;
+function render() {
+  if (video.readyState >= 2) {
+    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      gl.viewport(0, 0, canvas.width, canvas.height);
+    }
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+  rafId = requestAnimationFrame(render);
+}
+
+// ============== Twitch chat ==============
+video.addEventListener("ended", () => {
+  stage.classList.remove("show");
+  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+});
+
+function trigger(username) {
+  const now = Date.now();
+  if (now - lastTrigger < COOLDOWN_MS) {
+    console.log(`[cooldown] ignored !explosion from ${username}`);
+    return;
+  }
+  lastTrigger = now;
+  console.log(`[BOOM] ${username}`);
+
+  video.pause();
+  video.currentTime = 0;
+  stage.classList.add("show");
+  if (!rafId) render();
+  video.play().catch(err => console.error("video.play() failed:", err));
+}
+
+function connect() {
+  const ws = new WebSocket("wss://irc-ws.chat.twitch.tv:443");
+  ws.onopen = () => {
+    const nick = "justinfan" + Math.floor(Math.random() * 100000);
+    ws.send(`NICK ${nick}`);
+    ws.send(`JOIN #${CHANNEL.toLowerCase()}`);
+    setStatus(`connected to #${CHANNEL}`, true);
+  };
+  ws.onmessage = (e) => {
+    for (const line of e.data.split("\r\n")) {
+      if (!line) continue;
+      if (line.startsWith("PING")) { ws.send("PONG :tmi.twitch.tv"); continue; }
+      const m = line.match(/^:(\w+)!\w+@[\w.]+ PRIVMSG #\w+ :(.+)$/);
+      if (!m) continue;
+      if (m[2].trim().toLowerCase().startsWith(COMMAND.toLowerCase())) trigger(m[1]);
+    }
+  };
+  ws.onclose = () => {
+    setStatus("disconnected, reconnecting in 5s...");
+    setTimeout(connect, 5000);
+  };
+  ws.onerror = (err) => console.error("WebSocket error:", err);
+}
+
+connect();
+
+// ============== Autoplay unlock ==============
+// OBS Browser Source 不需要這個（已預設允許 autoplay），
+// 一般瀏覽器測試時點一次即可解鎖。
+const unlock = document.getElementById("unlock");
+
+// 在 OBS 環境通常 navigator.userAgent 有 "OBS"，直接隱藏
+if (navigator.userAgent.includes("OBS")) {
+  unlock.classList.add("hide");
+}
+
+unlock.addEventListener("click", async () => {
+  try {
+    video.muted = true;
+    await video.play();
+    video.pause();
+    video.currentTime = 0;
+    video.muted = false;
+  } catch (e) {
+    console.error("unlock failed:", e);
+  }
+  unlock.classList.add("hide");
+});
+</script>
+</body>
+</html>
